@@ -1,8 +1,6 @@
-from __future__ import print_function
+import json
 import torch
-import random
 import numpy as np
-import torch.utils
 import torch.nn as nn
 import torch.utils.checkpoint
 import torch.nn.functional as F
@@ -11,85 +9,22 @@ alphabet = 'ACDEFGHIKLMNPQRSTVWYX'
 
 
 def featurize(batch, device):
+    """Featurize single-chain structures with seq and coords (N, CA, C, O)."""
     B = len(batch)
-    L_max = max([len(b['seq']) for b in batch])
-
-    X = np.zeros([B, L_max, 4, 3])
-
-    # residue idx with jumps across chains
-    residue_idx = -100 * np.ones([B, L_max], dtype=np.int32)
-
-    # 1.0 for the bits that need to be predicted, 0.0 for the bits that are given
-    chain_M = np.zeros([B, L_max], dtype=np.int32)
-
-    # integer encoding for chains 0, 0, 0,...0, 1, 1,..., 1, 2, 2, 2...
-    chain_encoding_all = np.zeros([B, L_max], dtype=np.int32)
-
-    # sequence AAs integers
-    S = np.zeros([B, L_max], dtype=np.int32)
+    L_max = max(len(b['seq']) for b in batch)
+    X = np.full((B, L_max, 4, 3), np.nan)
+    residue_idx = np.full((B, L_max), -100, dtype=np.int64)
+    chain_M = np.zeros((B, L_max), dtype=np.float32)
+    chain_encoding_all = np.zeros((B, L_max), dtype=np.int64)
+    S = np.zeros((B, L_max), dtype=np.int64)
 
     for i, b in enumerate(batch):
-        masked_chains = b['masked_list']
-        visible_chains = b['visible_list']
-        all_chains = masked_chains + visible_chains
-        masked_temp_dict, visible_temp_dict = {}, {}
-        for letter in all_chains:
-            chain_seq = b[f'seq_chain_{letter}']
-            if letter in visible_chains: visible_temp_dict[letter] = chain_seq
-            elif letter in masked_chains: masked_temp_dict[letter] = chain_seq
-        for vm in masked_temp_dict.values():
-            for kv, vv in visible_temp_dict.items():
-                if vm == vv:
-                    if kv not in masked_chains: masked_chains.append(kv)
-                    if kv in visible_chains: visible_chains.remove(kv)
-        all_chains = masked_chains + visible_chains
-        
-        c, l0, l1 = 1, 0, 0
-        x_chain_list, chain_seq_list, chain_mask_list, chain_encoding_list = [], [], [], []
-        random.shuffle(all_chains)  # randomly shuffle chain order
-        for letter in all_chains:
-            chain_seq = b[f'seq_chain_{letter}']
-            chain_seq_list.append(chain_seq)
-            chain_length = len(chain_seq)
-
-            chain_coords = b[f'coords_chain_{letter}']  # this is a dictionary
-            x_chain_list.append(
-                np.stack([
-                    chain_coords[c] for c in [
-                        f'N_chain_{letter}', 
-                        f'CA_chain_{letter}', 
-                        f'C_chain_{letter}', 
-                        f'O_chain_{letter}'
-                    ]
-                ], 1)
-            )   # [chain_length, 4, 3]
-            
-            l1 += chain_length
-            residue_idx[i, l0: l1] = 100 * (c - 1) + np.arange(l0, l1)
-            l0 += chain_length
-            
-            if letter in visible_chains: chain_mask = np.zeros(chain_length) # 0.0 for visible chains
-            elif letter in masked_chains: chain_mask = np.ones(chain_length)  # 1.0 for masked chains
-            
-            chain_mask_list.append(chain_mask)
-            chain_encoding_list.append(c * np.ones(chain_mask.shape[0]))
-
-            c += 1
-        x = np.concatenate(x_chain_list, 0) # [L, 4, 3]
-        all_sequence = ''.join(chain_seq_list)
-        m = np.concatenate(chain_mask_list) # [L,], 1.0 for places that need to be predicted
-        chain_encoding = np.concatenate(chain_encoding_list)
-
-        l = len(all_sequence)
-        chain_M[i] = np.pad(m, [[0, L_max - l]], 'constant', constant_values=(0.0, ))
-        X[i] = np.pad(x, [[0, L_max - l], [0, 0], [0, 0]], 'constant', constant_values=(np.nan, ))
-        chain_encoding_all[i] = np.pad(
-            chain_encoding, [[0, L_max - l]], 'constant', constant_values=(0.0, )
-        )
-
-        # Convert to labels
-        indices = np.asarray([alphabet.index(a) for a in all_sequence], dtype=np.int32)
-        S[i, :l] = indices
+        length = len(b['seq'])
+        X[i, :length] = np.stack([b['coords'][atom] for atom in ('N', 'CA', 'C', 'O')], axis=1)
+        S[i, :length] = [alphabet.index(a) for a in b['seq']]
+        residue_idx[i, :length] = np.arange(length)
+        chain_M[i, :length] = 1
+        chain_encoding_all[i, :length] = 1
 
     mask = np.isfinite(np.sum(X, (2, 3))).astype(np.float32)
     X = np.nan_to_num(X)
@@ -102,18 +37,6 @@ def featurize(batch, device):
     chain_encoding_all = torch.from_numpy(chain_encoding_all).to(dtype=torch.long, device=device)
 
     return X, S, mask, chain_M, residue_idx, chain_encoding_all
-
-
-def loss_nll(S, log_probs, mask):
-    """ Negative log probabilities """
-    criterion = torch.nn.NLLLoss(reduction='none')
-    loss = criterion(
-        log_probs.contiguous().view(-1, log_probs.size(-1)), S.contiguous().view(-1)
-    ).view(S.size())
-    S_argmaxed = torch.argmax(log_probs,-1) #[B, L]
-    true_false = (S == S_argmaxed).float()
-    loss_av = torch.sum(loss * mask) / torch.sum(mask)
-    return loss, loss_av, true_false
 
 
 def loss_smoothed(S, log_probs, mask, weight=0.1):
@@ -146,11 +69,6 @@ def gather_nodes(nodes, neighbor_idx):
     neighbor_features = neighbor_features.view(neighbor_idx.shape[:3] + (-1, ))
     return neighbor_features
 
-def gather_nodes_t(nodes, neighbor_idx):
-    # Features [B,N,C] at Neighbor index [B,K] => Neighbor features[B,K,C]
-    idx_flat = neighbor_idx.unsqueeze(-1).expand(-1, -1, nodes.size(2))
-    neighbor_features = torch.gather(nodes, 1, idx_flat)
-    return neighbor_features
 
 def cat_neighbors_nodes(h_nodes, h_neighbors, E_idx):
     h_nodes = gather_nodes(h_nodes, E_idx)
@@ -201,7 +119,6 @@ class EncLayer(nn.Module):
         h_message = self.W13(self.act(self.W12(self.act(self.W11(h_EV)))))
         h_E = self.norm3(h_E + self.dropout3(h_message))
         return h_V, h_E
-
 
 
 class DecLayer(nn.Module):
@@ -291,9 +208,7 @@ class ProteinFeatures(nn.Module):
         D = mask_2D * torch.sqrt(torch.sum(dX ** 2, 3) + eps)
         D_max, _ = torch.max(D, -1, keepdim=True)
         D_adjust = D + (1. - mask_2D) * D_max
-        D_neighbors, E_idx = torch.topk(
-            D_adjust, np.minimum(self.top_k, X.shape[1]), dim=-1, largest=False
-        )
+        D_neighbors, E_idx = torch.topk(D_adjust, np.minimum(self.top_k, X.shape[1]), dim=-1, largest=False)
         return D_neighbors, E_idx
 
     def _rbf(self, D):
@@ -367,7 +282,6 @@ class ProteinFeatures(nn.Module):
         return E, E_idx
 
 
-
 class ProteinMPNN(nn.Module):
     def __init__(
         self, 
@@ -412,6 +326,7 @@ class ProteinMPNN(nn.Module):
         
         return h_V, h_E, E_idx
     
+
     def decode(self, S, h_V, h_E, E_idx, mask):
         device = S.device
 
@@ -546,42 +461,16 @@ class ProteinMPNN(nn.Module):
         return log_probs
 
 
-class NoamOpt:
-    "Optim wrapper that implements rate."
-    def __init__(self, model_size, factor, warmup, optimizer, step):
-        self.optimizer = optimizer
-        self._step = step
-        self.warmup = warmup
-        self.factor = factor
-        self.model_size = model_size
-        self._rate = 0
+class StructureDataset():
+    def __init__(self, jsonl_file):
+        self.data = []
+        with open(jsonl_file) as f:
+            lines = f.readlines()
+        for line in lines:
+            self.data.append(json.loads(line))
 
-    @property
-    def param_groups(self):
-        """Return param_groups."""
-        return self.optimizer.param_groups
+    def __len__(self):
+        return len(self.data)
 
-    def step(self):
-        "Update parameters and rate"
-        self._step += 1
-        rate = self.rate()
-        for p in self.optimizer.param_groups:
-            p['lr'] = rate
-        self._rate = rate
-        self.optimizer.step()
-
-    def rate(self, step = None):
-        "Implement `lrate` above"
-        if step is None:
-            step = self._step
-        return self.factor * \
-            (self.model_size ** (-0.5) *
-            min(step ** (-0.5), step * self.warmup ** (-1.5)))
-
-    def zero_grad(self):
-        self.optimizer.zero_grad()
-
-def get_std_opt(parameters, d_model, step):
-    return NoamOpt(
-        d_model, 2, 4000, torch.optim.Adam(parameters, lr=0, betas=(0.9, 0.98), eps=1e-9), step
-    )
+    def __getitem__(self, idx):
+        return self.data[idx]

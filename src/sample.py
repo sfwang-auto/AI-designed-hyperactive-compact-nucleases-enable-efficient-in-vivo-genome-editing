@@ -38,8 +38,13 @@ def main(args):
     
     with open(args.structure_path, 'rb') as f:
         pdb_dict = pickle.load(f)
-    pdb_dict['visible_list'] = []
-    pdb_dict['masked_list'] = ['A']
+    pdb_dict = {
+        'seq': pdb_dict['seq_chain_A'],
+        'coords': {
+            atom: pdb_dict['coords_chain_A'][f'{atom}_chain_A']
+            for atom in ('N', 'CA', 'C', 'O')
+        },
+    }
     X, _, mask, _, residue_idx, chain_encoding_all = featurize([pdb_dict], device)
     
     with torch.inference_mode():
